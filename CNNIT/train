@@ -1,0 +1,303 @@
+import os
+import logging
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torchvision import datasets, transforms
+from torch.cuda.amp import GradScaler, autocast
+from tensorboardX import SummaryWriter
+from model import CNNTransformer
+
+class AverageMeter:
+    """Computes and stores the average and current value"""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def setup_logging(log_dir):
+    """设置日志"""
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(log_dir, 'training.log')),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
+
+
+def get_data_loaders(data_dir, batch_size, num_workers):
+    """准备数据加载器"""
+    # 数据增强
+    train_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),  # 确保输出224x224
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),  # 确保输出224x224
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+
+    # 加载数据集
+    train_dataset = datasets.ImageFolder(
+        os.path.join(data_dir, '/kaggle/input/flower-classification/train'),
+        transform=train_transform
+    )
+
+    val_dataset = datasets.ImageFolder(
+        os.path.join(data_dir, '/kaggle/input/flower-classification/val'),
+        transform=val_transform
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
+
+    return train_loader, val_loader
+
+
+def train_epoch(model, train_loader, criterion, optimizer, scheduler,
+                scaler, epoch, device, logger):
+    """训练一个epoch"""
+    model.train()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
+    for i, (images, target) in enumerate(pbar):
+        images, target = images.to(device), target.to(device)
+
+        # 混合精度训练
+        with autocast():
+            output = model(images)
+            loss = criterion(output, target)
+
+        # 计算准确率
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        losses.update(loss.item(), images.size(0))
+        top1.update(acc1[0], images.size(0))
+        top5.update(acc5[0], images.size(0))
+
+        # 优化器步骤
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        # 更新学习率
+        scheduler.step()
+
+        # 更新进度条
+        pbar.set_postfix({
+            'Loss': f'{losses.avg:.3f}',
+            'Top1': f'{top1.avg:.3f}%',
+            'Top5': f'{top5.avg:.3f}%'
+        })
+
+    return losses.avg, top1.avg, top5.avg
+
+
+def validate(model, val_loader, criterion, device):
+    """验证模型"""
+    model.eval()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    with torch.no_grad():
+        for images, target in tqdm(val_loader, desc='Validate'):
+            images, target = images.to(device), target.to(device)
+
+            # 前向传播
+            output = model(images)
+            loss = criterion(output, target)
+
+            # 计算准确率
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            losses.update(loss.item(), images.size(0))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
+
+    return losses.avg, top1.avg, top5.avg
+
+
+def accuracy(output, target, topk=(1,)):
+    """计算top-k准确率"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+
+def save_checkpoint(state, is_best, checkpoint_dir):
+    """保存检查点"""
+    filename = os.path.join(checkpoint_dir, 'checkpoint.pth')
+    torch.save(state, filename)
+    if is_best:
+        best_filename = os.path.join(checkpoint_dir, 'model_best.pth')
+        torch.save(state, best_filename)
+
+
+def main():
+    # 训练配置
+    config = {
+        'data_dir': './data',
+        'log_dir': './logs',
+        'checkpoint_dir': './checkpoints',
+        'batch_size': 32,
+        'num_workers': 4,
+        'epochs': 100,
+        'learning_rate': 1e-3,
+        'weight_decay': 1e-4,
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'num_classes': 14  # 根据数据集修改
+    }
+
+    # 创建必要的目录
+    os.makedirs(config['log_dir'], exist_ok=True)
+    os.makedirs(config['checkpoint_dir'], exist_ok=True)
+
+    # 设置日志
+    logger = setup_logging(config['log_dir'])
+    writer = SummaryWriter(config['log_dir'])
+
+    # 创建模型
+    model = CNNTransformer(
+        img_size=224,
+        in_channels=3,
+        num_classes=config['num_classes'],
+        hidden_dim=768,
+        num_heads=12,
+        num_layers=12
+    ).to(config['device'])
+
+    # 定义损失函数和优化器
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=config['learning_rate'],
+        weight_decay=config['weight_decay']
+    )
+
+    # 学习率调度器
+    scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=config['epochs'],
+        eta_min=1e-6
+    )
+
+    # 获取数据加载器
+    train_loader, val_loader = get_data_loaders(
+        config['data_dir'],
+        config['batch_size'],
+        config['num_workers']
+    )
+
+    # 混合精度训练
+    scaler = GradScaler()
+
+    # 记录最佳验证准确率
+    best_acc = 0.0
+
+    # 训练循环
+    for epoch in range(config['epochs']):
+        # 训练一个epoch
+        train_loss, train_acc1, train_acc5 = train_epoch(
+            model, train_loader, criterion, optimizer, scheduler,
+            scaler, epoch, config['device'], logger
+        )
+
+        # 验证
+        val_loss, val_acc1, val_acc5 = validate(
+            model, val_loader, criterion, config['device']
+        )
+
+        # 记录到TensorBoard
+        writer.add_scalar('Loss/train', train_loss, epoch)
+        writer.add_scalar('Loss/val', val_loss, epoch)
+        writer.add_scalar('Acc/train_top1', train_acc1, epoch)
+        writer.add_scalar('Acc/val_top1', val_acc1, epoch)
+        writer.add_scalar('Acc/train_top5', train_acc5, epoch)
+        writer.add_scalar('Acc/val_top5', val_acc5, epoch)
+        writer.add_scalar('Lr', optimizer.param_groups[0]['lr'], epoch)
+
+        # 保存最佳模型
+        is_best = val_acc1 > best_acc
+        best_acc = max(val_acc1, best_acc)
+
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'best_acc1': best_acc,
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+        }, is_best, config['checkpoint_dir'])
+
+        # 记录日志
+        logger.info(
+            f'Epoch: {epoch}/{config["epochs"]} | '
+            f'Train Loss: {train_loss:.3f} | '
+            f'Train Acc@1: {train_acc1:.3f}% | '
+            f'Train Acc@5: {train_acc5:.3f}% | '
+            f'Val Loss: {val_loss:.3f} | '
+            f'Val Acc@1: {val_acc1:.3f}% | '
+            f'Val Acc@5: {val_acc5:.3f}% | '
+            f'LR: {optimizer.param_groups[0]["lr"]:.6f}'
+        )
+
+    writer.close()
+
+
+if __name__ == '__main__':
+    main()
