@@ -1,0 +1,390 @@
+!pip install efficientnet_pytorch
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from efficientnet_pytorch import EfficientNet
+from torch.utils.data import DataLoader
+import torchvision.transforms as transforms
+# 配置类
+class Config:
+    num_classes = 21  # VOC数据集20类 + 背景
+    learning_rate = 1e-4
+    batch_size = 16
+    num_epochs = 100
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# 定义损失函数类
+class DetectionLoss:
+    def __init__(self, device):
+        self.cls_criterion = nn.CrossEntropyLoss().to(device)
+        self.reg_criterion = nn.SmoothL1Loss().to(device)
+    
+    def __call__(self, cls_preds, reg_preds, targets):
+        batch_cls_loss = 0
+        batch_reg_loss = 0
+        batch_size = len(targets)
+        
+        for i in range(batch_size):
+            sample_cls_loss = 0
+            sample_reg_loss = 0
+            
+            target = targets[i]
+            target_labels = target['labels']  # [num_objects]
+            target_boxes = target['boxes']    # [num_objects, 4]
+            
+            for feature_idx in range(len(cls_preds)):
+                # 获取当前特征层的预测
+                cls_pred = cls_preds[feature_idx][i]  # [C, H, W]
+                reg_pred = reg_preds[feature_idx][i]  # [4, H, W]
+                
+                # 重塑预测以匹配目标形状
+                num_anchors = cls_pred.size(1) * cls_pred.size(2)  # H * W
+                cls_pred = cls_pred.permute(1, 2, 0).contiguous()  # [H, W, C]
+                cls_pred = cls_pred.view(num_anchors, -1)          # [H*W, C]
+                
+                reg_pred = reg_pred.permute(1, 2, 0).contiguous() # [H, W, 4]
+                reg_pred = reg_pred.view(num_anchors, -1)         # [H*W, 4]
+                
+                # 为每个anchor分配目标
+                # 这里简化处理，使用第一个目标作为所有anchor的目标
+                if len(target_labels) > 0:
+                    target_cls = target_labels[0].expand(num_anchors)
+                    target_reg = target_boxes[0].expand(num_anchors, 4)
+                else:
+                    # 如果没有目标，则所有anchor都预测背景
+                    target_cls = torch.zeros(num_anchors, dtype=torch.long).to(cls_pred.device)
+                    target_reg = torch.zeros(num_anchors, 4).to(reg_pred.device)
+                
+                # 计算损失
+                sample_cls_loss += self.cls_criterion(cls_pred, target_cls)
+                sample_reg_loss += self.reg_criterion(reg_pred, target_reg)
+            
+            batch_cls_loss += sample_cls_loss
+            batch_reg_loss += sample_reg_loss
+        
+        # 计算平均损失
+        total_loss = (batch_cls_loss + batch_reg_loss) / batch_size
+        return total_loss, batch_cls_loss / batch_size, batch_reg_loss / batch_size
+class FeatureFusion(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(FeatureFusion, self).__init__()
+        self.conv1x1 = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.conv3x3 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn = nn.BatchNorm2d(out_channels)
+        
+    def forward(self, x):
+        x = self.conv1x1(x)
+        x = self.conv3x3(x)
+        x = self.bn(x)
+        return F.relu(x)
+
+class PredictionHead(nn.Module):
+    def __init__(self, in_channels, n_classes):
+        super(PredictionHead, self).__init__()
+        self.n_classes = n_classes
+        
+        self.cls_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, n_classes, kernel_size=1)  # 使用1x1卷积输出类别预测
+        )
+        
+        self.reg_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 4, kernel_size=1)  # 使用1x1卷积输出边界框预测
+        )
+        
+    def forward(self, x):
+        cls_pred = self.cls_head(x)  # [B, num_classes, H, W]
+        reg_pred = self.reg_head(x)  # [B, 4, H, W]
+        return cls_pred, reg_pred
+
+class FSSD(nn.Module):
+    def __init__(self, n_classes, backbone='efficientnet-b0'):  # 将 num_classes 改为 n_classes
+        super(FSSD, self).__init__()
+        
+        self.backbone = EfficientNet.from_pretrained(backbone)
+        
+        self.fusion_layers = nn.ModuleList([
+            FeatureFusion(80, 256),
+            FeatureFusion(112, 256),
+            FeatureFusion(320, 256)
+        ])
+        
+        self.prediction_heads = nn.ModuleList([
+            PredictionHead(256, n_classes) for _ in range(3)  # 使用 n_classes
+        ])
+        
+    def forward(self, x):
+        features = []
+        x = self.backbone._swish(self.backbone._bn0(self.backbone._conv_stem(x)))
+        
+        for idx, block in enumerate(self.backbone._blocks):
+            x = block(x)
+            if idx == 5:
+                features.append(x)
+            elif idx == 8:
+                features.append(x)
+            elif idx == 15:
+                features.append(x)
+        
+        fused_features = []
+        for feat, fusion_layer in zip(features, self.fusion_layers):
+            if feat.size(-1) != 18:
+                feat = F.interpolate(feat, size=(18, 18), mode='bilinear', align_corners=False)
+            fused_features.append(fusion_layer(feat))
+            
+        cls_preds = []
+        reg_preds = []
+        for feat, head in zip(fused_features, self.prediction_heads):
+            cls_pred, reg_pred = head(feat)
+            cls_preds.append(cls_pred)
+            reg_preds.append(reg_pred)
+            
+        return cls_preds, reg_preds
+def count_parameters(model):
+    """计算模型的参数量"""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return {
+        'Total': total_params,
+        'Trainable': trainable_params
+    }
+
+def calculate_iou(box1, box2):
+    """计算两个边界框的IOU"""
+    # 计算交集
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    
+    # 计算并集
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = box1_area + box2_area - intersection
+    
+    return intersection / union if union > 0 else 0
+def calculate_batch_recall(cls_preds, reg_preds, targets, iou_threshold=0.5):
+    """计算批次的召回率"""
+    total_recall = 0
+    batch_size = len(targets)
+    
+    for i in range(batch_size):
+        true_boxes = targets[i]['boxes']
+        true_labels = targets[i]['labels']
+        
+        # 获取预测
+        batch_recalls = []
+        for feature_idx in range(len(cls_preds)):
+            cls_pred = cls_preds[feature_idx][i]  # [C, H, W]
+            reg_pred = reg_preds[feature_idx][i]  # [4, H, W]
+            
+            # 处理预测结果
+            cls_pred = F.softmax(cls_pred, dim=0)
+            cls_scores, cls_labels = cls_pred.max(dim=0)
+            
+            # 转换预测框格式
+            pred_boxes = reg_pred.permute(1, 2, 0).reshape(-1, 4)
+            
+            # 计算每个真实框是否被检测到
+            detected = [False] * len(true_boxes)
+            for box_idx, true_box in enumerate(true_boxes):
+                for pred_box, score, pred_label in zip(pred_boxes, cls_scores.view(-1), cls_labels.view(-1)):
+                    if score > 0.5 and pred_label == true_labels[box_idx]:
+                        iou = calculate_iou(pred_box.cpu(), true_box.cpu())
+                        if iou >= iou_threshold:
+                            detected[box_idx] = True
+                            break
+            
+            recall = sum(detected) / len(true_boxes) if len(true_boxes) > 0 else 1.0
+            batch_recalls.append(recall)
+        
+        total_recall += max(batch_recalls) if batch_recalls else 0
+    
+    return total_recall / batch_size
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0
+    total_recall = 0
+    num_batches = len(dataloader)
+    
+    for batch_idx, (images, targets) in enumerate(dataloader):
+        images = images.to(device)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        
+        cls_preds, reg_preds = model(images)
+        
+        loss, cls_loss, reg_loss = criterion(cls_preds, reg_preds, targets)
+        
+        # 计算召回率
+        batch_recall = calculate_batch_recall(cls_preds, reg_preds, targets)
+        total_recall += batch_recall
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+        
+        if batch_idx % 100 == 0:
+            print(f'Batch [{batch_idx}/{len(dataloader)}], '
+                  f'Loss: {loss.item():.4f}, '
+                  f'Cls Loss: {cls_loss.item():.4f}, '
+                  f'Reg Loss: {reg_loss.item():.4f}, '
+                  f'Recall: {batch_recall:.4f}')
+    
+    avg_loss = total_loss / num_batches
+    avg_recall = total_recall / num_batches
+    return avg_loss, avg_recall
+
+import torch
+from torch.utils.data import Dataset
+import torchvision.transforms as transforms
+from PIL import Image
+import numpy as np
+from torchvision.datasets import VOCDetection  # 添加这行
+
+VOC_CLASSES = [
+    'background', 'aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus', 'car',
+    'cat', 'chair', 'cow', 'diningtable', 'dog', 'horse', 'motorbike', 'person',
+    'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'
+]
+
+class VOCDataset(Dataset):
+    def __init__(self, voc_dataset, transform=None):
+        self.voc_dataset = voc_dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.voc_dataset)
+
+    def __getitem__(self, idx):
+        img, anno = self.voc_dataset[idx]
+        
+        if self.transform:
+            img = self.transform(img)
+        
+        boxes = []
+        labels = []
+        
+        for obj in anno['annotation']['object']:
+            bbox = obj['bndbox']
+            boxes.append([
+                float(bbox['xmin']), 
+                float(bbox['ymin']), 
+                float(bbox['xmax']), 
+                float(bbox['ymax'])
+            ])
+            labels.append(VOC_CLASSES.index(obj['name']))
+        
+        if len(boxes) == 0:
+            boxes.append([0, 0, 1, 1])
+            labels.append(0)
+        
+        boxes = torch.FloatTensor(boxes)
+        labels = torch.LongTensor(labels)
+        
+        boxes = boxes / torch.tensor([300, 300, 300, 300])
+        
+        target = {
+            'boxes': boxes,
+            'labels': labels
+        }
+        
+        return img, target
+
+def collate_fn(batch):
+    images = []
+    targets = []
+    for img, target in batch:
+        images.append(img)
+        targets.append(target)
+    
+    images = torch.stack(images, 0)
+    return images, targets
+def main():
+    config = Config()
+    
+    # 初始化模型
+    model = FSSD(n_classes=config.num_classes)
+    model = model.to(config.device)
+    
+    # 计算并打印模型参数量
+    params_info = count_parameters(model)
+    print(f"Model Parameters:")
+    print(f"Total parameters: {params_info['Total']:,}")
+    print(f"Trainable parameters: {params_info['Trainable']:,}")
+    
+    criterion = DetectionLoss(config.device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+    
+    transform = transforms.Compose([
+        transforms.Resize((300, 300)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                           std=[0.229, 0.224, 0.225])
+    ])
+
+    voc_dataset = VOCDetection(
+        root="./data", 
+        year="2012", 
+        image_set="train", 
+        download=True
+    )
+    
+    dataset = VOCDataset(voc_dataset, transform=transform)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=config.batch_size, 
+        shuffle=True, 
+        collate_fn=collate_fn,
+        num_workers=4
+    )
+    
+    # 训练循环
+    best_recall = 0
+    for epoch in range(config.num_epochs):
+        print(f'Epoch [{epoch+1}/{config.num_epochs}]')
+        
+        train_loss, train_recall = train_one_epoch(
+            model=model,
+            dataloader=dataloader,
+            criterion=criterion,
+            optimizer=optimizer,
+            device=config.device
+        )
+        
+        scheduler.step()
+        
+        print(f'Epoch [{epoch+1}/{config.num_epochs}], '
+              f'Average Loss: {train_loss:.4f}, '
+              f'Average Recall: {train_recall:.4f}')
+        
+        # 保存最佳模型
+        if train_recall > best_recall:
+            best_recall = train_recall
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': train_loss,
+                'recall': train_recall,
+            }, 'best_model.pth')
+        
+        # 定期保存检查点
+        if (epoch + 1) % 10 == 0:
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': train_loss,
+                'recall': train_recall,
+            }, f'checkpoint_epoch_{epoch+1}.pth')
+
+if __name__ == '__main__':
+    main()
